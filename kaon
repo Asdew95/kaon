@@ -1,0 +1,250 @@
+#!/bin/bash
+
+if [[ -z "$KAON_DIR" ]]; then
+    KAON_DIR=/var/lib/kaon
+fi
+
+INSTALL_DIR="$KAON_INSTALL_DIR"
+if [[ -z "$INSTALL_DIR" ]]; then
+    INSTALL_DIR=/
+fi
+
+func_exists() {
+    command -v "$1" > /dev/null 2>&1
+}
+
+build_kaon() {
+    if [ -z "$kaonbuild" ]; then
+        if [ ! -z "$1" ]; then
+            local kaonbuild="$1"
+        else
+            local kaonbuild="kaonbuild"
+        fi
+    fi
+
+    if [ -d "$kaonbuild" ]; then
+        local kaonbuild="$kaonbuild/kaonbuild"
+    fi
+
+    if [ ! -f "$kaonbuild" ]; then
+        echo "Error: File $kaonbuild not found" 1>&2
+        exit 1
+    fi
+
+    source "$kaonbuild"
+    echo "Building $name version $version"
+    pushd "$(dirname -- "$kaonbuild")" > /dev/null
+    local kaonbuild=$(basename -- "$kaonbuild")
+    local rootdir=$(pwd)
+    local bin="$rootdir/bin"
+    local src="$rootdir/src"
+
+    mkdir -p src bin
+
+    if ! (func_exists download && func_exists package); then
+        echo "ERROR: Invalid kaonbuild" 1>&2
+        exit 1
+    fi
+
+    if ! download; then
+        echo "ERROR: Download failed" 1>&2
+        exit 1
+    fi
+
+    if func_exists build; then
+        cd "$rootdir"
+        if ! build; then
+            echo "ERROR: Build failed" 1>&2
+            exit 1
+        fi
+    fi
+
+    cd "$rootdir"
+    if ! package; then
+        echo "ERROR: Packaging failed" 1>&2
+        exit 1
+    fi
+
+    cd "$rootdir"
+    echo "Creating package archive $name-$version.tar.gz"
+    cp "$kaonbuild" bin/kaonbuild
+    cd bin
+    fakeroot -- tar czf ../$name-$version.tar.gz *
+    popd > /dev/null
+}
+
+installed_package_version() {
+    pkg="$(grep -e "^$1/" "$KAON_DIR/installed")"
+    echo "$pkg"
+}
+
+install_pkg() {
+    pkg="$1"
+
+    if [[ ! -f "$pkg" ]]; then
+        echo "Package $pkg not found" 1>&2
+        return 1
+    fi
+
+    kaonbuild_tmp="$(mktemp)"
+
+    tar xOzf $pkg kaonbuild > "$kaonbuild_tmp"
+
+    source "$kaonbuild_tmp"
+    echo "Installing $name version $version"
+
+    old_version=$(installed_package_version "$name")
+    if [[ ! -z "$old_version" ]]; then
+        if [[ $REINSTALL != yes ]]; then
+            echo "Package $name already installed"
+            rm "$kaonbuild_tmp"
+            return
+        fi
+        was_installed=yes
+    fi
+
+    mkdir -p "$KAON_DIR/$name/$version"
+    cp "$kaonbuild_tmp" "$KAON_DIR/$name/$version/kaonbuild"
+    rm "$kaonbuild_tmp"
+    
+    files=$(tar tf "$pkg" --exclude kaonbuild)
+    if [[ $was_installed == yes ]]; then
+        files_to_delete=$(comm -23 <(sort "$KAON_DIR/$old_version/files") <(sort <(echo "$files")))
+    fi
+
+    echo "$files" > "$KAON_DIR/$name/$version/files"
+
+    tar xzf "$pkg" -C "$INSTALL_DIR" --exclude kaonbuild
+    if func_exists postinstall; then
+        postinstall
+    fi
+    echo "$name/$version" >> "$KAON_DIR/installed"
+    
+    if [[ ! -z "$files_to_delete" ]]; then
+        clean_files $files_to_delete
+        echo "$(grep -v "$old_version" "$KAON_DIR/installed")" > "$KAON_DIR/installed"
+    fi
+}
+
+clean_files() {
+    for file in $@; do
+        if [[ ! -d "$INSTALL_DIR/$file" ]]; then
+            echo "Deleting $file"
+            rm "$INSTALL_DIR/$file"
+        fi
+    done
+
+    # Delete empty leftover directories
+    DELETED=1
+    while [[ $DELETED -ne 0 ]]; do
+        DELETED=0
+        for file in $@; do
+            if [[ -d "$INSTALL_DIR/$file" ]]; then
+                if ! mountpoint "$INSTALL_DIR/$file" > /dev/null; then
+                    if [[ -z "$(ls -A "$INSTALL_DIR/$file")" ]]; then
+                        echo "Deleting $file"
+                        rm -r "$INSTALL_DIR/$file"
+                        if [[ $? -eq 0 ]]; then 
+                            DELETED=1
+                        fi
+                    fi
+                fi
+            fi
+        done
+    done
+}
+
+remove_pkg() {
+    pkg="$(grep -e "^$1/" "$KAON_DIR/installed")"
+    if [[ -z "$pkg" ]]; then
+        echo "ERROR: Package $1 not installed" 1>&2
+        return 1
+    fi
+
+    pkgdir="$KAON_DIR/$pkg"
+    files="$(cat "$pkgdir/files")"
+
+    clean_files $files
+
+    echo "$(grep -v "$pkg" "$KAON_DIR/installed")" > "$KAON_DIR/installed"
+}
+
+init_installer() {
+    if [[ "$EUID" -ne 0 ]]; then
+        if [[ "$KAON_DIR" == /var/lib/kaon || "$INSTALL_DIR" == / ]]; then
+            echo "ERROR: Run as root!" 1>&2
+            exit 1
+        fi
+    fi
+
+    mkdir -p "$KAON_DIR"
+    touch "$KAON_DIR/installed"
+}
+
+REINSTALL=no
+
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+    key="$1"
+
+    case $key in
+        i|install)
+            if [[ -z "$ACTION" ]]; then
+                ACTION="INSTALL"
+            else
+                POSITIONAL+=("$1")
+            fi
+            shift
+            ;;
+        r|remove)
+            if [[ -z "$ACTION" ]]; then
+                ACTION="REMOVE"
+            else
+                POSITIONAL+=("$1")
+            fi
+            shift
+            ;;
+        b|build)
+            if [[ -z "$ACTION" ]]; then
+                ACTION="BUILD"
+            else
+                POSITIONAL+=("$1")
+            fi
+            shift
+            ;;
+        -r|--reinstall)
+            REINSTALL=yes
+            shift
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${POSITIONAL[@]}"
+
+if [[ -z "$ACTION" ]]; then
+    echo "What do you want me to do?" 1>&2
+    exit 1
+fi
+
+case $ACTION in
+    INSTALL)
+        init_installer
+        for pkg in "${POSITIONAL[@]}"; do
+            install_pkg "$pkg"
+        done
+        ;;
+    REMOVE)
+        init_installer
+        for pkg in "${POSITIONAL[@]}"; do
+            remove_pkg "$pkg"
+        done
+        ;;
+    BUILD)
+        for pkg in "${POSITIONAL[@]}"; do
+            build_kaon "$pkg"
+        done
+        ;;
+esac
